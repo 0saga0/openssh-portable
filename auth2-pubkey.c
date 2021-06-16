@@ -1,4 +1,4 @@
-/* $OpenBSD: auth2-pubkey.c,v 1.106 2021/01/27 10:05:28 djm Exp $ */
+/* $OpenBSD: auth2-pubkey.c,v 1.108 2021/06/08 06:54:40 djm Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  *
@@ -475,7 +475,8 @@ match_principals_command(struct ssh *ssh, struct passwd *user_pw,
 	}
 
 	/* Turn the command into an argument vector */
-	if (argv_split(options.authorized_principals_command, &ac, &av) != 0) {
+	if (argv_split(options.authorized_principals_command,
+	    &ac, &av, 0) != 0) {
 		error("AuthorizedPrincipalsCommand \"%s\" contains "
 		    "invalid quotes", options.authorized_principals_command);
 		goto out;
@@ -674,7 +675,8 @@ check_authkey_line(struct ssh *ssh, struct passwd *pw, struct sshkey *key,
 		goto fail_reason;
 	}
 	if (sshkey_cert_check_authority(key, 0, 0, 0,
-	   keyopts->cert_principals == NULL ? pw->pw_name : NULL, &reason) != 0)
+	    keyopts->cert_principals == NULL ? pw->pw_name : NULL,
+	    &reason) != 0)
 		goto fail_reason;
 
 	verbose("Accepted certificate ID \"%s\" (serial %llu) "
@@ -785,7 +787,7 @@ user_cert_trusted_ca(struct ssh *ssh, struct passwd *pw, struct sshkey *key,
 		found_principal = 1;
 	/* If principals file or command is specified, then require a match */
 	use_authorized_principals = principals_file != NULL ||
-            options.authorized_principals_command != NULL;
+	    options.authorized_principals_command != NULL;
 	if (!found_principal && use_authorized_principals) {
 		reason = "Certificate does not contain an authorized principal";
 		goto fail_reason;
@@ -925,7 +927,7 @@ user_key_command_allowed2(struct ssh *ssh, struct passwd *user_pw,
 	}
 
 	/* Turn the command into an argument vector */
-	if (argv_split(options.authorized_keys_command, &ac, &av) != 0) {
+	if (argv_split(options.authorized_keys_command, &ac, &av, 0) != 0) {
 		error("AuthorizedKeysCommand \"%s\" contains invalid quotes",
 		    options.authorized_keys_command);
 		goto out;

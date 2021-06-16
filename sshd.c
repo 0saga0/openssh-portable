@@ -1,4 +1,4 @@
-/* $OpenBSD: sshd.c,v 1.570 2021/02/05 02:20:23 dtucker Exp $ */
+/* $OpenBSD: sshd.c,v 1.576 2021/06/10 03:14:14 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -124,6 +124,7 @@
 #include "ssherr.h"
 #include "sk-api.h"
 #include "srclimit.h"
+#include "dh.h"
 
 /* Re-exec fds */
 #define REEXEC_DEVCRYPTO_RESERVED_FD	(STDERR_FILENO + 1)
@@ -365,11 +366,14 @@ grace_alarm_handler(int sig)
 		kill(0, SIGTERM);
 	}
 
-	/* XXX pre-format ipaddr/port so we don't need to access active_state */
 	/* Log error and exit. */
-	sigdie("Timeout before authentication for %s port %d",
-	    ssh_remote_ipaddr(the_active_state),
-	    ssh_remote_port(the_active_state));
+	if (use_privsep && pmonitor != NULL && pmonitor->m_pid <= 0)
+		cleanup_exit(255); /* don't log in privsep child */
+	else {
+		sigdie("Timeout before authentication for %s port %d",
+		    ssh_remote_ipaddr(the_active_state),
+		    ssh_remote_port(the_active_state));
+	}
 }
 
 /* Destroy the host and server keys.  They will no longer be needed. */
@@ -1137,6 +1141,7 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 	socklen_t fromlen;
 	pid_t pid;
 	u_char rnd[256];
+	sigset_t nsigset, osigset;
 
 	/* setup fd set for accept */
 	fdset = NULL;
@@ -1151,10 +1156,31 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 		startup_pipes[i] = -1;
 
 	/*
+	 * Prepare signal mask that we use to block signals that might set
+	 * received_sigterm or received_sighup, so that we are guaranteed
+	 * to immediately wake up the pselect if a signal is received after
+	 * the flag is checked.
+	 */
+	sigemptyset(&nsigset);
+	sigaddset(&nsigset, SIGHUP);
+	sigaddset(&nsigset, SIGCHLD);
+	sigaddset(&nsigset, SIGTERM);
+	sigaddset(&nsigset, SIGQUIT);
+
+	/*
 	 * Stay listening for connections until the system crashes or
 	 * the daemon is killed with a signal.
 	 */
 	for (;;) {
+		sigprocmask(SIG_BLOCK, &nsigset, &osigset);
+		if (received_sigterm) {
+			logit("Received signal %d; terminating.",
+			    (int) received_sigterm);
+			close_listen_socks();
+			if (options.pid_file != NULL)
+				unlink(options.pid_file);
+			exit(received_sigterm == SIGTERM ? 0 : 255);
+		}
 		if (ostartups != startups) {
 			setproctitle("%s [listener] %d of %d-%d startups",
 			    listener_proctitle, startups,
@@ -1167,8 +1193,10 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 				close_listen_socks();
 				lameduck = 1;
 			}
-			if (listening <= 0)
+			if (listening <= 0) {
+				sigprocmask(SIG_SETMASK, &osigset, NULL);
 				sighup_restart();
+			}
 		}
 		free(fdset);
 		fdset = xcalloc(howmany(maxfd + 1, NFDBITS),
@@ -1180,18 +1208,11 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 			if (startup_pipes[i] != -1)
 				FD_SET(startup_pipes[i], fdset);
 
-		/* Wait in select until there is a connection. */
-		ret = select(maxfd+1, fdset, NULL, NULL, NULL);
+		/* Wait until a connection arrives or a child exits. */
+		ret = pselect(maxfd+1, fdset, NULL, NULL, NULL, &osigset);
 		if (ret == -1 && errno != EINTR)
-			error("select: %.100s", strerror(errno));
-		if (received_sigterm) {
-			logit("Received signal %d; terminating.",
-			    (int) received_sigterm);
-			close_listen_socks();
-			if (options.pid_file != NULL)
-				unlink(options.pid_file);
-			exit(received_sigterm == SIGTERM ? 0 : 255);
-		}
+			error("pselect: %.100s", strerror(errno));
+		sigprocmask(SIG_SETMASK, &osigset, NULL);
 		if (ret == -1)
 			continue;
 
@@ -1701,7 +1722,7 @@ main(int ac, char **av)
 	 */
 	if (test_flag < 2 && connection_info != NULL)
 		fatal("Config test connection parameter (-C) provided without "
-		   "test mode (-T)");
+		    "test mode (-T)");
 
 	/* Fetch our configuration */
 	if ((cfg = sshbuf_new()) == NULL)
@@ -1723,6 +1744,11 @@ main(int ac, char **av)
 
 	parse_server_config(&options, rexeced_flag ? "rexec" : config_file_name,
 	    cfg, &includes, NULL);
+
+#ifdef WITH_OPENSSL
+	if (options.moduli_file != NULL)
+		dh_set_moduli_file(options.moduli_file);
+#endif
 
 	/* Fill in default values for those options not explicitly set. */
 	fill_default_server_options(&options);
@@ -1908,7 +1934,7 @@ main(int ac, char **av)
 		/* Find matching private key */
 		for (j = 0; j < options.num_host_key_files; j++) {
 			if (sshkey_equal_public(key,
-			    sensitive_data.host_keys[j])) {
+			    sensitive_data.host_pubkeys[j])) {
 				sensitive_data.host_certificates[j] = key;
 				break;
 			}
@@ -2010,8 +2036,10 @@ main(int ac, char **av)
 	/* Reinitialize the log (because of the fork above). */
 	log_init(__progname, options.log_level, options.log_facility, log_stderr);
 
-	/* Chdir to the root directory so that the current disk can be
-	   unmounted if desired. */
+	/*
+	 * Chdir to the root directory so that the current disk can be
+	 * unmounted if desired.
+	 */
 	if (chdir("/") == -1)
 		error("chdir(\"/\"): %s", strerror(errno));
 
